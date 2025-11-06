@@ -1,6 +1,27 @@
 
 import * as vscode from 'vscode';
 
+import {io} from 'socket.io-client';
+
+import * as Y from "yjs";
+import { WebsocketProvider } from "y-websocket";
+import WebSocket from "ws";
+
+(global as any).WebSocket = WebSocket;
+
+const doc = new Y.Doc();
+
+let uid = '';
+
+const socket = io('https://collab.silverspace.io', {
+  path: '/socket.io'
+})
+
+socket.on('connect', () => {
+  vscode.window.showInformationMessage('connected to socket.io server with id: ' + socket.id)
+
+  if (socket.id) uid = socket.id;
+})
 
 export function activate(context: vscode.ExtensionContext) {
 
@@ -8,61 +29,27 @@ export function activate(context: vscode.ExtensionContext) {
 
 
   context.subscriptions.push(vscode.commands.registerCommand('collab.buffer', () => {
-    vscode.window.showInformationMessage('working! :)')
-    ws.send("testing buffers...")
-    ws.send(new Uint8Array([10, 20, 30]))
+    vscode.window.showInformationMessage('testing buffers...')
+  }))
+
+  context.subscriptions.push(vscode.commands.registerCommand('collab.joinRoom', async () => {
+    const roomName = await vscode.window.showInputBox({prompt: 'Room name to join:', placeHolder: 'Room Name'})
+    if (roomName) {
+      vscode.window.showInformationMessage(`Joining room: ${roomName}`)
+      const provider = new WebsocketProvider('wss://sync.silverspace.io', roomName, doc, {params: {uid, pass: 'silly'}})
+
+      provider.on('status', (event) => {
+        vscode.window.showInformationMessage(event.toString())
+        if (event.status === "connected") {
+          vscode.window.showInformationMessage('Connected to y-websocket server!')
+        } else {
+          vscode.window.showInformationMessage('oooop')
+        }
+      })
+    } else {
+      vscode.window.showWarningMessage('Invalid room name')
+    }
   }))
 }
 
 export function deactivate() {}
-
-import * as Y from "yjs";
-import WebSocket from "ws";
-
-const doc = new Y.Doc();
-const ws = new WebSocket("wss://colab.silverspace.io");
-
-ws.on("open", () => {
-  console.log("hello")
-  ws.send(JSON.stringify({ type: "joinRoom", room: "my-room" }));
-});
-
-ws.on("message", (data: WebSocket.RawData) => {
-  let update: Uint8Array;
-
-  if (typeof data === "string") {
-    const msg = JSON.parse(data);
-    console.log("Control message:", msg);
-    return;
-  } else if (data instanceof Buffer) {
-    update = new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
-  } else if (data instanceof ArrayBuffer) {
-    update = new Uint8Array(data);
-  } else if (Array.isArray(data)) {
-    const length = data.reduce((sum, buf) => sum + buf.byteLength, 0);
-    const temp = new Uint8Array(length);
-    let offset = 0;
-    for (const buf of data) {
-      temp.set(new Uint8Array(buf.buffer, buf.byteOffset, buf.byteLength), offset);
-      offset += buf.byteLength;
-    }
-    update = temp;
-  } else {
-    return;
-  }
-
-  Y.applyUpdate(doc, update);
-});
-
-doc.on("update", (update: Uint8Array) => {
-  if (ws.readyState === ws.OPEN) {
-    ws.send(update);
-  }
-});
-
-// Shared text
-const yText = doc.getText("sharedText");
-
-yText.observe(() => {
-  console.log("Shared text:", yText.toString());
-});
