@@ -17,8 +17,8 @@
   "contributes": {
     "commands": [
       {
-        "command": "collab.buffer",
-        "title": "Buffer test"
+        "command": "collab.createRoom",
+        "title": "Create Room"
       },
        {
         "command": "collab.joinRoom",
