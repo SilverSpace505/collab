@@ -20,9 +20,17 @@
         "command": "collab.createRoom",
         "title": "Create Room"
       },
-       {
+      {
         "command": "collab.joinRoom",
         "title": "Join Room"
+      },
+      {
+        "command": "collab.leaveRoom",
+        "title": "Leave Room"
+      },
+      {
+        "command": "collab.debugTest",
+        "title": "Debug Test"
       }
     ]
   },

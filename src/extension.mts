@@ -6,6 +6,11 @@ import {io} from 'socket.io-client';
 import * as Y from "yjs";
 import { WebsocketProvider } from "y-websocket";
 import WebSocket from "ws";
+import { createCursorDecoration, decorationTypes, getRelativePath } from './utils.mjs';
+import { FileNode, getWorkspaceTree } from './scan.mjs';
+import { getFileStats, readDirectory, readFile } from './host.mjs';
+
+import { FILE_SYSTEM_SCHEME, FileProvider } from './files.mjs';
 
 (global as any).WebSocket = WebSocket;
 
@@ -14,70 +19,406 @@ interface RoomData {
   users: number;
 }
 
-const doc = new Y.Doc();
+let loadStatus: vscode.StatusBarItem | undefined;
+
+let doc: Y.Doc | undefined;
+let ytext: Y.Text | undefined;
+let cursors: Y.Map<{
+  start: number;
+  end: number;
+  color: string;
+}> | undefined;
 
 let uid = '';
+let room = '';
+let isHost = false;
+
+let clientColor: string | undefined;
+
+let provider: WebsocketProvider | undefined;
+let suppressEditorChange: boolean | undefined;
+
+let fileProvider: FileProvider | undefined;
+let fileSystemProviderDisposable: vscode.Disposable | undefined;
 
 const socket = io('https://collab.silverspace.io', {
   path: '/socket.io'
 })
 
 socket.on('connect', () => {
-  vscode.window.showInformationMessage('connected to socket.io server with id: ' + socket.id)
+  vscode.window.showInformationMessage('Connected with id: ' + socket.id)
 
   if (socket.id) uid = socket.id;
+
+  recoverState()
 })
+
+socket.on('userLeft', (uid: string) => {
+  const editor = vscode.window.activeTextEditor;
+  if (!editor) return;
+
+  if (!cursors) return;
+  cursors.delete(uid);
+
+  vscode.window.showInformationMessage(`deleting user cursor: ${uid}`)
+
+  const deco = decorationTypes.get(uid);
+  if (deco) {
+    editor.setDecorations(deco, []);
+  }
+  decorationTypes.delete(uid);
+})
+
+socket.on('roomDeleted', () => {
+  vscode.window.showInformationMessage('Host deleted room :(')
+
+  room = '';
+  isHost = false;
+
+  ytext = undefined;
+  doc = undefined;
+  cursors = undefined;
+  clientColor = undefined;
+
+  if (provider) provider.disconnect();
+
+  if (loadStatus) loadStatus.hide();
+
+  vscode.commands.executeCommand('workbench.action.closeFolder');
+})
+
+socket.on('disconnect', () => {
+  vscode.window.showInformationMessage('Disconnected from server')
+
+  const hasRoom = !!room;
+
+  // reset state
+  uid = '';
+  room = '';
+  isHost = false;
+
+  ytext = undefined;
+  doc = undefined;
+  cursors = undefined;
+  clientColor = undefined;
+
+  if (provider) provider.disconnect();
+
+  if (loadStatus) loadStatus.hide()
+
+  if (hasRoom) vscode.commands.executeCommand('workbench.action.closeFolder');
+})
+
+
+socket.on('statFile', async (uri: string, callback) => {
+  callback(await getFileStats(uri));
+});
+socket.on('readDirectory', async (uri: string, callback) => {
+  callback(await readDirectory(uri));
+});
+socket.on('readFile', async (uri: string, callback) => {
+  callback(await readFile(uri));
+});
+
 
 async function createRoom() {
   const roomName = await vscode.window.showInputBox({placeHolder: 'Room Name'})
   const pass = await vscode.window.showInputBox({placeHolder: 'Password (leave blank for no password)'})
   if (roomName) {
-    socket.emit('getRooms', (rooms: Record<string, RoomData>) => {
-      const roomList = Object.keys(rooms);
-      vscode.window.showInformationMessage(roomList.join(', '));
-      console.log(rooms)
-      if (roomList.includes(roomName)) {
-        vscode.window.showWarningMessage('Room already exists.')
+    socket.emit('createRoom', roomName, pass, async (response: string) => {
+      vscode.window.showInformationMessage(response);
+      if (response == 'Room already exists') {
         createRoom()
         return;
       }
+      if (response == 'Created room') {
+        room = roomName;
+        isHost = true;
+        socket.emit('workspaceTree', await getWorkspaceTree())
 
-      const provider = new WebsocketProvider('wss://sync.silverspace.io', roomName, doc, {params: pass ? {uid, pass} : {uid}})
-
-      provider.on('status', (event) => {
-        if (event.status === "connected") {
-          vscode.window.showInformationMessage('Connected to y-websocket server!')
-        } else {
-          vscode.window.showInformationMessage('oooop')
-        }
-      })
+        const editor = vscode.window.activeTextEditor;
+        if (!editor) return;
+        const file = getRelativePath(editor.document.uri);
+        if (!file || !room) return;
+        connectToFile(file, editor)
+      }
     })
   }
 }
 
-export function activate(context: vscode.ExtensionContext) {
+async function joinRoom(rooms: Record<string, RoomData>, troom: string, context: vscode.ExtensionContext) {
+  let pass;
+  if (rooms[troom].hasPass) {
+    pass = await vscode.window.showInputBox({placeHolder: 'Password'})
+  }
+
+  socket.emit('joinRoom', troom, pass, (response: string) => {
+    vscode.window.showInformationMessage(response);
+    if (response == 'Wrong password') {
+      joinRoom(rooms, troom, context)
+      return;
+    }
+    if (response == 'Joined room') {
+      room = troom;
+      isHost = false;
+
+      const state = {uid, pass: Math.floor(Math.random() * 100000) + '', room}
+      context.globalState.update('state', state);
+      socket.emit('saveState', state.pass)
+      
+      if (fileProvider) fileProvider.root = room;
+
+      const workspaceUri = vscode.Uri.parse(`${FILE_SYSTEM_SCHEME}://collab/${room}/`);
+      vscode.commands.executeCommand('vscode.openFolder', workspaceUri, { forceNewWindow: false });
+
+      // vscode.commands.executeCommand('vscode.openFolder', workspaceUri, { forceNewWindow: false, name: room });
+
+      // const statusBarItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left);
+      // statusBarItem.text = `$(radio-tower) ${room}`;
+      // statusBarItem.show();
+
+      const editor = vscode.window.activeTextEditor;
+      if (!editor) return;
+      const file = getRelativePath(editor.document.uri);
+      if (!file || !room) return;
+      connectToFile(file, editor)
+    }
+  })
+}
+
+function connectToFile(file: string, editor: vscode.TextEditor) {
+  if (loadStatus) {
+    loadStatus.show()
+    loadStatus.text = `$(sync~spin) Collab connecting`;
+    loadStatus.tooltip = 'Connecting to yjs sync server';
+    loadStatus.backgroundColor = undefined;
+  }
+  if (provider) {
+    if (cursors) {
+      cursors.delete(uid)
+    }
+    provider.disconnect();
+  }
+
+  clientColor = "#" + Math.floor(Math.random() * 0xffffff).toString(16);
+
+  doc = new Y.Doc();
+
+  ytext = doc.getText('content');
+
+  cursors = doc.getMap<{start: number; end: number; color: string;}>('cursors');
+
+  provider = new WebsocketProvider('wss://sync.silverspace.io', file, doc, {params: {uid}})
+
+  provider.on('status', (event) => {
+    if (event.status === "connected") {
+      // vscode.window.showInformationMessage(`Connected to file: ${file}`)
+
+      if (loadStatus) {
+        loadStatus.text = `$(check-all) Collab connected`;
+        loadStatus.tooltip = 'Connected to yjs sync server';
+        loadStatus.backgroundColor = undefined;
+      }
+    
+      if (!cursors || !clientColor) return;
+      cursors.set(uid, {
+        start: editor.document.offsetAt(editor.selection.start),
+        end: editor.document.offsetAt(editor.selection.end),
+        color: clientColor,
+      });
+    } else {
+      if (loadStatus) {
+        loadStatus.text = `$(circle-slash) Collab disconnected`;
+        loadStatus.tooltip = 'Failed to connect to yjs sync server';
+        loadStatus.backgroundColor = undefined;
+      }
+      // vscode.window.showInformationMessage(`Disconnected from file: ${file}`)
+    }
+  })
+
+  suppressEditorChange = false;
+
+  ytext.observe((event, transaction) => {
+    if (transaction.origin === "local") return;
+
+      if (suppressEditorChange || !ytext) return;
+
+      const text = ytext.toString();
+      const current = editor.document.getText();
+      if (current === text) return;
+
+      suppressEditorChange = true;
+      editor.edit((editBuilder) => {
+        editBuilder.replace(
+          new vscode.Range(
+            editor.document.positionAt(0),
+            editor.document.positionAt(current.length)
+          ),
+          text
+        );
+      }).then(() => suppressEditorChange = false);
+  })
+
+  cursors.observe(() => {
+    const decorations: vscode.DecorationOptions[] = [];
+    if (!cursors) return;
+      for (const [id, cursorData] of cursors.entries()) {
+        if (id === uid) continue;
+
+        const data = cursorData as { start: number; end: number; color: string };
+        const start = editor.document.positionAt(data.start);
+        const end = editor.document.positionAt(data.end);
+
+        let deco = decorationTypes.get(id);
+        if (!deco) {
+          deco = createCursorDecoration(data.color);
+          decorationTypes.set(id, deco);
+        }
+
+        decorations.push({ range: new vscode.Range(start, end) });
+        editor.setDecorations(deco, decorations);
+      }
+      const keys = Array.from(cursors.keys());
+      const decoKeys = decorationTypes.keys();
+      for (const deco of decoKeys) {
+        if (!keys.includes(deco)) {
+          const deco2 = decorationTypes.get(deco)
+          if (!deco2) continue;
+          editor.setDecorations(deco2, [])
+          decorationTypes.delete(deco)
+        }
+      }
+  })
+}
+
+let state: {uid: string, pass: string, room: string} | undefined;
+
+function recoverState() {
+  if (!state) return;
+  socket.emit('recoverState', state.uid, state.pass)
+  room = state.room;
+}
+
+export async function activate(context: vscode.ExtensionContext) {
+
+  state = context.globalState.get('state');
+
+  const workspaceFolders = vscode.workspace.workspaceFolders;
+  const isCollabWorkspace = workspaceFolders?.some(
+    folder => folder.uri.scheme === FILE_SYSTEM_SCHEME
+  );
+
+  if (isCollabWorkspace) {
+    if (!state) {
+      vscode.window.showErrorMessage('Room closed.');
+      vscode.commands.executeCommand('workbench.action.closeFolder');
+      return;
+    }
+  }
+
+  if (socket.connected) {
+    recoverState()
+  }
+  context.globalState.update('state', undefined);
+
   context.subscriptions.push(vscode.commands.registerCommand('collab.createRoom', createRoom))
 
   context.subscriptions.push(vscode.commands.registerCommand('collab.joinRoom', async () => {
     socket.emit('getRooms', async (rooms: Record<string, RoomData>) => {
       const roomName = await vscode.window.showQuickPick(Object.keys(rooms), {placeHolder: 'Room to join'})
       if (roomName) {
-        let pass;
-        if (rooms[roomName].hasPass) {
-          pass = await vscode.window.showInputBox({placeHolder: 'Password'})
-        }
-        const provider = new WebsocketProvider('wss://sync.silverspace.io', roomName, doc, {params: pass ? {uid, pass} : {uid}})
-
-        provider.on('status', (event) => {
-          if (event.status === "connected") {
-            vscode.window.showInformationMessage('Connected to y-websocket server!')
-          } else {
-            vscode.window.showInformationMessage('oooop')
-          }
-        })
+        joinRoom(rooms, roomName, context)
       }
     })
   }))
+
+  context.subscriptions.push(vscode.commands.registerCommand('collab.leaveRoom', () => {
+    if (provider) provider.disconnect();
+    socket.emit('leaveRoom', () => {
+      vscode.window.showInformationMessage('Left room');
+      const wasHost = isHost;
+      room = '';
+      isHost = false;
+
+      ytext = undefined;
+      doc = undefined;
+      cursors = undefined;
+      clientColor = undefined;
+
+      if (loadStatus) loadStatus.hide()
+
+      if (!wasHost) vscode.commands.executeCommand('workbench.action.closeFolder');
+    })
+  }))
+
+  context.subscriptions.push(vscode.commands.registerCommand('collab.debugTest', () => {
+    const editor = vscode.window.activeTextEditor;
+    if (!editor) return;
+    socket.emit('statFile', getRelativePath(editor.document.uri), (stat: vscode.FileStat) => {
+      console.log(stat);
+    }) 
+  }))
+
+  vscode.window.onDidChangeActiveTextEditor((event) => {
+    if (!event) return;
+    const file = getRelativePath(event.document.uri);
+    if (!file) return;
+    // vscode.window.showInformationMessage(`opened file: ${file}`)
+
+    if (!room) return;
+    connectToFile(file, event)
+  })
+
+  vscode.workspace.onDidChangeTextDocument((event) => {
+    const cytext = ytext;
+    if (!cytext) return;
+    const editor = vscode.window.activeTextEditor;
+    if (!editor || editor.document !== event.document) return;
+
+    if (suppressEditorChange) return;
+
+    if (cytext.doc) cytext.doc.transact(() => {
+      cytext.delete(0, cytext.length);
+      cytext.insert(0, editor.document.getText());
+    }, "local");
+  });
+
+  vscode.window.onDidChangeTextEditorSelection((event) => {
+    const editor = event.textEditor;
+    if (!editor) return;
+
+    if (!cursors || !clientColor) return;
+    cursors.set(uid, {
+      start: editor.document.offsetAt(editor.selection.start),
+      end: editor.document.offsetAt(editor.selection.end),
+      color: clientColor,
+    });
+  })
+
+  socket.once('connect', async () => {
+    fileProvider = new FileProvider(socket);
+    await fileProvider.waitForConnection();
+    fileProvider.root = room;
+    console.log(room, fileProvider.root)
+    console.log("connected to server")
+    fileSystemProviderDisposable = vscode.workspace.registerFileSystemProvider(
+      FILE_SYSTEM_SCHEME,
+      fileProvider,
+      { isCaseSensitive: true }
+    );
+    context.subscriptions.push(fileSystemProviderDisposable);
+  })
+
+  loadStatus = vscode.window.createStatusBarItem(
+      vscode.StatusBarAlignment.Left,
+      100
+  );
+  
+  context.subscriptions.push(loadStatus);
 }
 
-export function deactivate() {}
+export function deactivate() {
+  if (fileSystemProviderDisposable) {
+    fileSystemProviderDisposable.dispose();
+  }
+}
