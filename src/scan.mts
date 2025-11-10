@@ -2,6 +2,10 @@ import * as vscode from "vscode";
 import * as fs from "fs/promises";
 import * as path from "path";
 
+// this file was used to get the file system, but it's not used for anything anymore
+
+///////////////////
+// AI Code
 export interface FileNode {
   name: string;
   relativePath: string;
@@ -59,3 +63,4 @@ export async function getWorkspaceTree(): Promise<
 
   return result;
 }
+///////////////////

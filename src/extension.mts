@@ -6,9 +6,9 @@ import {io} from 'socket.io-client';
 import * as Y from "yjs";
 import { WebsocketProvider } from "y-websocket";
 import WebSocket from "ws";
-import { createCursorDecoration, decorationTypes, getRelativePath } from './utils.mjs';
+import { createCursorDecoration, decorationTypes, getRelativePath, getRelativePathUri } from './utils.mjs';
 import { FileNode, getWorkspaceTree } from './scan.mjs';
-import { getFileStats, readDirectory, readFile } from './host.mjs';
+import { createDirectory, deleteFile, getAbsoluteUri, getFileStats, readDirectory, readFile, renameFile, writeFile } from './host.mjs';
 
 import { FILE_SYSTEM_SCHEME, FileProvider } from './files.mjs';
 
@@ -18,6 +18,8 @@ interface RoomData {
   hasPass: boolean;
   users: number;
 }
+
+let workspaceWatcher: vscode.FileSystemWatcher | undefined;
 
 let loadStatus: vscode.StatusBarItem | undefined;
 
@@ -46,11 +48,17 @@ const socket = io('https://collab.silverspace.io', {
 })
 
 socket.on('connect', () => {
-  vscode.window.showInformationMessage('Connected with id: ' + socket.id)
+  // vscode.window.showInformationMessage('Connected with id: ' + socket.id)
 
   if (socket.id) uid = socket.id;
 
   recoverState()
+
+  if (loadStatus) {
+    loadStatus.text = `$(check-all) Server connected`;
+    loadStatus.tooltip = 'Connected to socket.io server';
+    loadStatus.backgroundColor = undefined;
+  }
 })
 
 socket.on('userLeft', (uid: string) => {
@@ -60,17 +68,17 @@ socket.on('userLeft', (uid: string) => {
   if (!cursors) return;
   cursors.delete(uid);
 
-  vscode.window.showInformationMessage(`deleting user cursor: ${uid}`)
+  // vscode.window.showInformationMessage(`deleting user cursor: ${uid}`)
 
   const deco = decorationTypes.get(uid);
   if (deco) {
     editor.setDecorations(deco, []);
   }
   decorationTypes.delete(uid);
-})
+});
 
 socket.on('roomDeleted', () => {
-  vscode.window.showInformationMessage('Host deleted room :(')
+  vscode.window.showInformationMessage('Host closed room :(');
 
   room = '';
   isHost = false;
@@ -80,17 +88,23 @@ socket.on('roomDeleted', () => {
   cursors = undefined;
   clientColor = undefined;
 
+  if (loadStatus) {
+    loadStatus.text = `$(check-all) Server connected`;
+    loadStatus.tooltip = 'Connected to socket.io server';
+    loadStatus.backgroundColor = undefined;
+  }
+
   if (provider) provider.disconnect();
 
-  if (loadStatus) loadStatus.hide();
-
   vscode.commands.executeCommand('workbench.action.closeFolder');
-})
+});
 
 socket.on('disconnect', () => {
-  vscode.window.showInformationMessage('Disconnected from server')
+  // vscode.window.showInformationMessage('Disconnected from server')
 
-  const hasRoom = !!room;
+  if (workspaceWatcher) workspaceWatcher.dispose()
+
+  const hasRoom = !!room && !isHost;
 
   // reset state
   uid = '';
@@ -104,7 +118,11 @@ socket.on('disconnect', () => {
 
   if (provider) provider.disconnect();
 
-  if (loadStatus) loadStatus.hide()
+  if (loadStatus) {
+    loadStatus.text = `$(sync~spin) Server connecting`;
+    loadStatus.tooltip = 'Connecting to socket.io server';
+    loadStatus.backgroundColor = undefined;
+  }
 
   if (hasRoom) vscode.commands.executeCommand('workbench.action.closeFolder');
 })
@@ -120,21 +138,82 @@ socket.on('readFile', async (uri: string, callback) => {
   callback(await readFile(uri));
 });
 
+socket.on('createDirectory', async (uri: string, callback) => {
+  callback(await createDirectory(uri))
+});
+socket.on('writeFile', async (uri: string, content: Uint8Array, options: { readonly create: boolean; readonly overwrite: boolean; }, callback) => {
+  await writeFile(uri, content, options)
 
-async function createRoom() {
+  ///////////
+  // AI code
+  // If the host has this file open, save it to clear the dirty indicator
+  const absoluteUri = getAbsoluteUri(uri);
+  if (absoluteUri) {
+    const doc = vscode.workspace.textDocuments.find(d => d.uri.toString() === absoluteUri.toString());
+    if (doc && doc.isDirty) {
+      await doc.save();
+    }
+  }
+  ///////////
+
+  callback()
+});
+socket.on('deleteFile', async (uri: string, options: { readonly recursive: boolean; }, callback) => {
+  callback(await deleteFile(uri, options))
+});
+socket.on('renameFile', async (uri: string, newuri: string, options: { readonly overwrite: boolean; }, callback) => {
+  callback(await renameFile(uri, newuri, options))
+});
+
+///////////////
+// AI code
+// Add handler for when files change (host saves or external changes)
+socket.on('fileChanged', async (changes: Array<{uri: string, type: vscode.FileChangeType}>) => {
+  for (const change of changes) {
+    // Find if we have this file open
+    const doc = vscode.workspace.textDocuments.find(d => getRelativePathUri(d.uri) === change.uri);
+    if (doc && doc.isDirty) {
+      // Host saved their file, so save ours too to clear the dot
+      await doc.save();
+    }
+    // if (change.type === vscode.FileChangeType.d) {
+      
+    // }
+  }
+});
+///////////////
+
+async function createRoom(context: vscode.ExtensionContext) {
   const roomName = await vscode.window.showInputBox({placeHolder: 'Room Name'})
   const pass = await vscode.window.showInputBox({placeHolder: 'Password (leave blank for no password)'})
   if (roomName) {
     socket.emit('createRoom', roomName, pass, async (response: string) => {
       vscode.window.showInformationMessage(response);
       if (response == 'Room already exists') {
-        createRoom()
+        createRoom(context)
         return;
       }
       if (response == 'Created room') {
         room = roomName;
         isHost = true;
         socket.emit('workspaceTree', await getWorkspaceTree())
+
+        // Create the watcher
+        workspaceWatcher = vscode.workspace.createFileSystemWatcher('**/*');
+
+        workspaceWatcher.onDidCreate(uri => {
+          socket.emit('fileChanged', [{ uri: getRelativePathUri(uri), type: vscode.FileChangeType.Created }]);
+        });
+
+        workspaceWatcher.onDidChange(uri => {
+          socket.emit('fileChanged', [{ uri: getRelativePathUri(uri), type: vscode.FileChangeType.Changed }]);
+        });
+
+        workspaceWatcher.onDidDelete(uri => {
+          socket.emit('fileChanged', [{ uri: getRelativePathUri(uri), type: vscode.FileChangeType.Deleted }]);
+        });
+
+        context.subscriptions.push(workspaceWatcher);
 
         const editor = vscode.window.activeTextEditor;
         if (!editor) return;
@@ -164,31 +243,24 @@ async function joinRoom(rooms: Record<string, RoomData>, troom: string, context:
 
       const state = {uid, pass: Math.floor(Math.random() * 100000) + '', room}
       context.globalState.update('state', state);
-      socket.emit('saveState', state.pass)
-      
-      if (fileProvider) fileProvider.root = room;
+      socket.emit('saveState', state.pass, () => {
+        if (fileProvider) fileProvider.root = room;
 
-      const workspaceUri = vscode.Uri.parse(`${FILE_SYSTEM_SCHEME}://collab/${room}/`);
-      vscode.commands.executeCommand('vscode.openFolder', workspaceUri, { forceNewWindow: false });
+        const workspaceUri = vscode.Uri.parse(`${FILE_SYSTEM_SCHEME}://collab/${room}/`);
+        vscode.commands.executeCommand('vscode.openFolder', workspaceUri, { forceNewWindow: false });
 
-      // vscode.commands.executeCommand('vscode.openFolder', workspaceUri, { forceNewWindow: false, name: room });
-
-      // const statusBarItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left);
-      // statusBarItem.text = `$(radio-tower) ${room}`;
-      // statusBarItem.show();
-
-      const editor = vscode.window.activeTextEditor;
-      if (!editor) return;
-      const file = getRelativePath(editor.document.uri);
-      if (!file || !room) return;
-      connectToFile(file, editor)
+        // const editor = vscode.window.activeTextEditor;
+        // if (!editor) return;
+        // const file = getRelativePath(editor.document.uri);
+        // if (!file || !room) return;
+        // connectToFile(file, editor)
+      })
     }
   })
 }
 
 function connectToFile(file: string, editor: vscode.TextEditor) {
   if (loadStatus) {
-    loadStatus.show()
     loadStatus.text = `$(sync~spin) Collab connecting`;
     loadStatus.tooltip = 'Connecting to yjs sync server';
     loadStatus.backgroundColor = undefined;
@@ -321,7 +393,7 @@ export async function activate(context: vscode.ExtensionContext) {
   }
   context.globalState.update('state', undefined);
 
-  context.subscriptions.push(vscode.commands.registerCommand('collab.createRoom', createRoom))
+  context.subscriptions.push(vscode.commands.registerCommand('collab.createRoom', () => {createRoom(context)}))
 
   context.subscriptions.push(vscode.commands.registerCommand('collab.joinRoom', async () => {
     socket.emit('getRooms', async (rooms: Record<string, RoomData>) => {
@@ -340,12 +412,18 @@ export async function activate(context: vscode.ExtensionContext) {
       room = '';
       isHost = false;
 
+      if (workspaceWatcher) workspaceWatcher.dispose()
+
       ytext = undefined;
       doc = undefined;
       cursors = undefined;
       clientColor = undefined;
 
-      if (loadStatus) loadStatus.hide()
+      if (loadStatus) {
+        loadStatus.text = `$(check-all) Server connected`;
+        loadStatus.tooltip = 'Connected to socket.io server';
+        loadStatus.backgroundColor = undefined;
+      }
 
       if (!wasHost) vscode.commands.executeCommand('workbench.action.closeFolder');
     })
@@ -362,10 +440,7 @@ export async function activate(context: vscode.ExtensionContext) {
   vscode.window.onDidChangeActiveTextEditor((event) => {
     if (!event) return;
     const file = getRelativePath(event.document.uri);
-    if (!file) return;
-    // vscode.window.showInformationMessage(`opened file: ${file}`)
-
-    if (!room) return;
+    if (!file || !room) return;
     connectToFile(file, event)
   })
 
@@ -410,9 +485,14 @@ export async function activate(context: vscode.ExtensionContext) {
   })
 
   loadStatus = vscode.window.createStatusBarItem(
-      vscode.StatusBarAlignment.Left,
-      100
+    vscode.StatusBarAlignment.Left,
+    100
   );
+
+  loadStatus.show()
+  loadStatus.text = `$(sync~spin) Server connecting`;
+  loadStatus.tooltip = 'Connecting to socket.io server';
+  loadStatus.backgroundColor = undefined;
   
   context.subscriptions.push(loadStatus);
 }
