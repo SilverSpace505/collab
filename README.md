@@ -20,8 +20,8 @@ Use Ctrl/Cmd + Shift + P to bring up the command pallete
 - Friends system for quick room management
 - Maybe class managment system for teachers
 
- **Known bugs**
- - Document sometimes duplicates when multple users are typing.
- - Cursors fall out of sync when typing.
- - Typing in the document moves other's cursors.
- - Typing causes other's documents to flash white.
+**Known bugs**
+- Document sometimes duplicates when multple users are typing.
+- Cursors fall out of sync when typing.
+- Typing in the document moves other's cursors.
+- Typing causes other's documents to flash white.
