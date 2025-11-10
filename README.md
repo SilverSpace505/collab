@@ -3,6 +3,7 @@
 This is an extension for vscode that uses yjs-websocket in combination with a socket.io server to enable realtime collaboration in vscode.
 
 **How to use**
+
 Use Ctrl/Cmd + Shift + P to bring up the command pallete
 - Use *Join Room* to start a session
 - Use *Create Room* to join a session
