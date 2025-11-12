@@ -3,7 +3,7 @@ import * as vscode from 'vscode';
 
 import {type Socket} from 'socket.io-client';
 
-export const FILE_SYSTEM_SCHEME = 'collab-fs'
+export const FILE_SYSTEM_SCHEME = 'collab'
 
 export class FileProvider implements vscode.FileSystemProvider {
   socket: Socket;

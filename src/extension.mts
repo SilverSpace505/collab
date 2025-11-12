@@ -299,11 +299,11 @@ function connectToFile(file: string, editor: vscode.TextEditor) {
         color: clientColor,
       });
     } else {
-      if (loadStatus) {
-        loadStatus.text = `$(circle-slash) Collab disconnected`;
-        loadStatus.tooltip = 'Failed to connect to yjs sync server';
-        loadStatus.backgroundColor = undefined;
-      }
+      // if (loadStatus) {
+      //   loadStatus.text = `$(circle-slash) Collab disconnected`;
+      //   loadStatus.tooltip = 'Failed to connect to yjs sync server';
+      //   loadStatus.backgroundColor = undefined;
+      // }
       // vscode.window.showInformationMessage(`Disconnected from file: ${file}`)
     }
   })
