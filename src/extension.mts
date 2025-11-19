@@ -23,19 +23,20 @@ let workspaceWatcher: vscode.FileSystemWatcher | undefined;
 
 let loadStatus: vscode.StatusBarItem | undefined;
 
+// these are going to store the synced state of the text in the document and other's users
 let doc: Y.Doc | undefined;
 let ytext: Y.Text | undefined;
 let cursors: Y.Map<{
   start: number;
   end: number;
-  color: string;
+  colour: string;
 }> | undefined;
 
 let uid = '';
 let room = '';
 let isHost = false;
 
-let clientColor: string | undefined;
+let clientColour: string | undefined;
 
 let provider: WebsocketProvider | undefined;
 let suppressEditorChange: boolean | undefined;
@@ -43,15 +44,18 @@ let suppressEditorChange: boolean | undefined;
 let fileProvider: FileProvider | undefined;
 let fileSystemProviderDisposable: vscode.Disposable | undefined;
 
+// connect to socket.io server
 const socket = io('https://collab.silverspace.io', {
   path: '/socket.io'
 })
 
+// triggers when connected to server
 socket.on('connect', () => {
   // vscode.window.showInformationMessage('Connected with id: ' + socket.id)
 
   if (socket.id) uid = socket.id;
 
+  // when loading into a new window, the connection state needs to be recovered
   recoverState()
 
   if (loadStatus) {
@@ -61,10 +65,12 @@ socket.on('connect', () => {
   }
 })
 
+// triggers when user leaves room
 socket.on('userLeft', (uid: string) => {
   const editor = vscode.window.activeTextEditor;
   if (!editor) return;
 
+  // remove the user's cursors from the editor
   if (!cursors) return;
   cursors.delete(uid);
 
@@ -77,16 +83,19 @@ socket.on('userLeft', (uid: string) => {
   decorationTypes.delete(uid);
 });
 
+// triggers when the host of the room leaves, so this client needs to disconnect
 socket.on('roomDeleted', () => {
   vscode.window.showInformationMessage('Host closed room :(');
 
+  // reset state
   room = '';
   isHost = false;
 
+  // reset syncing state
   ytext = undefined;
   doc = undefined;
   cursors = undefined;
-  clientColor = undefined;
+  clientColour = undefined;
 
   if (loadStatus) {
     loadStatus.text = `$(check-all) Server connected`;
@@ -94,11 +103,14 @@ socket.on('roomDeleted', () => {
     loadStatus.backgroundColor = undefined;
   }
 
+  // disconnect from yjs syncing server
   if (provider) provider.disconnect();
 
+  // close virtual workspace of the collaboration environment
   vscode.commands.executeCommand('workbench.action.closeFolder');
 });
 
+// triggers when the user disocnnects from the socket.io server
 socket.on('disconnect', () => {
   // vscode.window.showInformationMessage('Disconnected from server')
 
@@ -111,11 +123,13 @@ socket.on('disconnect', () => {
   room = '';
   isHost = false;
 
+  // reset sync state
   ytext = undefined;
   doc = undefined;
   cursors = undefined;
-  clientColor = undefined;
+  clientColour = undefined;
 
+  // disconnect from yjs syncing server
   if (provider) provider.disconnect();
 
   if (loadStatus) {
@@ -124,10 +138,11 @@ socket.on('disconnect', () => {
     loadStatus.backgroundColor = undefined;
   }
 
+  // if the user is currently in a room, then close the virtual workspace
   if (hasRoom) vscode.commands.executeCommand('workbench.action.closeFolder');
 })
 
-
+// these series of callbacks take in requests from other users to read and write data to the host's system.
 socket.on('statFile', async (uri: string, callback) => {
   callback(await getFileStats(uri));
 });
@@ -183,22 +198,29 @@ socket.on('fileChanged', async (changes: Array<{uri: string, type: vscode.FileCh
 });
 ///////////////
 
+// creates a new room using the users's currently opened workspace
 async function createRoom(context: vscode.ExtensionContext) {
+  // first, ask for the name of the room and password
   const roomName = await vscode.window.showInputBox({placeHolder: 'Room Name'})
   const pass = await vscode.window.showInputBox({placeHolder: 'Password (leave blank for no password)'})
+  
+  // if they actually did type in a room name
   if (roomName) {
-    socket.emit('createRoom', roomName, pass, async (response: string) => {
+    // send a request to the server to create a room using the info
+    socket.emit('createRoom', roomName, pass, async (response: string) => { // callback from server
       vscode.window.showInformationMessage(response);
+      // if the room already exists, then try again.
       if (response == 'Room already exists') {
         createRoom(context)
         return;
       }
+      // if the room was created successfully, update the state
       if (response == 'Created room') {
         room = roomName;
         isHost = true;
         socket.emit('workspaceTree', await getWorkspaceTree())
 
-        // Create the watcher
+        // start the filesystem watcher that will update clients of this user with file changes 
         workspaceWatcher = vscode.workspace.createFileSystemWatcher('**/*');
 
         workspaceWatcher.onDidCreate(uri => {
@@ -219,33 +241,47 @@ async function createRoom(context: vscode.ExtensionContext) {
         if (!editor) return;
         const file = getRelativePath(editor.document.uri);
         if (!file || !room) return;
+
+        // if a file is currently open, connect to the corresponding syncing server
         connectToFile(file, editor)
       }
     })
   }
 }
 
+// join a room given a list of the availabale rooms
 async function joinRoom(rooms: Record<string, RoomData>, troom: string, context: vscode.ExtensionContext) {
+  // if the room has a password, then ask for one
   let pass;
   if (rooms[troom].hasPass) {
     pass = await vscode.window.showInputBox({placeHolder: 'Password'})
   }
 
-  socket.emit('joinRoom', troom, pass, (response: string) => {
+  // send a request to the server to join a room
+  socket.emit('joinRoom', troom, pass, (response: string) => { // callback from server
     vscode.window.showInformationMessage(response);
+    // if the password was incorrect, then try again
     if (response == 'Wrong password') {
       joinRoom(rooms, troom, context)
       return;
     }
+    // if the user successfully joins the room, then set the state
     if (response == 'Joined room') {
       room = troom;
       isHost = false;
 
+      // store the user id and their room in the global state
+      // required to maintain the connection and authentication accross the switching of workspaces
+      // (when a new workspace is opened, the client disconnects from the server, and the state is normally lost)
+      // a random number is generated to act as a temporary password to prevent other users from stealing the state
       const state = {uid, pass: Math.floor(Math.random() * 100000) + '', room}
       context.globalState.update('state', state);
+
+      // the connection state of the user is then uploaded to the server
       socket.emit('saveState', state.pass, () => {
         if (fileProvider) fileProvider.root = room;
 
+        // then the workspace is switched the collab workspace, so the host's files can be loaded in the new window
         const workspaceUri = vscode.Uri.parse(`${FILE_SYSTEM_SCHEME}://collab/${room}/`);
         vscode.commands.executeCommand('vscode.openFolder', workspaceUri, { forceNewWindow: false });
 
@@ -259,12 +295,14 @@ async function joinRoom(rooms: Record<string, RoomData>, troom: string, context:
   })
 }
 
+// given a relative path to the file, connect and manage the syncing on the content in the file
 function connectToFile(file: string, editor: vscode.TextEditor) {
   if (loadStatus) {
     loadStatus.text = `$(sync~spin) Collab connecting`;
     loadStatus.tooltip = 'Connecting to yjs sync server';
     loadStatus.backgroundColor = undefined;
   }
+  // if already connected to another syncing server, disconnect and remove any cursors
   if (provider) {
     if (cursors) {
       cursors.delete(uid)
@@ -272,16 +310,22 @@ function connectToFile(file: string, editor: vscode.TextEditor) {
     provider.disconnect();
   }
 
-  clientColor = "#" + Math.floor(Math.random() * 0xffffff).toString(16);
+  // generate a new random colour for the user's cursor to appear on other's editors
+  clientColour = "#" + Math.floor(Math.random() * 0xffffff).toString(16);
 
+  // create a syncing context
   doc = new Y.Doc();
 
+  // get content of the file
   ytext = doc.getText('content');
 
-  cursors = doc.getMap<{start: number; end: number; color: string;}>('cursors');
+  // get the cursors
+  cursors = doc.getMap<{start: number; end: number; colour: string;}>('cursors');
 
+  // connect to the syncing server, passing in the uid of the user to authenticate
   provider = new WebsocketProvider('wss://sync.silverspace.io', file, doc, {params: {uid}})
 
+  // triggers once the user connects / disconnects
   provider.on('status', (event) => {
     if (event.status === "connected") {
       // vscode.window.showInformationMessage(`Connected to file: ${file}`)
@@ -291,12 +335,13 @@ function connectToFile(file: string, editor: vscode.TextEditor) {
         loadStatus.tooltip = 'Connected to yjs sync server';
         loadStatus.backgroundColor = undefined;
       }
-    
-      if (!cursors || !clientColor) return;
+      
+      // upload current cursor to synced state
+      if (!cursors || !clientColour) return;
       cursors.set(uid, {
         start: editor.document.offsetAt(editor.selection.start),
         end: editor.document.offsetAt(editor.selection.end),
-        color: clientColor,
+        colour: clientColour,
       });
     } else {
       // if (loadStatus) {
@@ -310,6 +355,7 @@ function connectToFile(file: string, editor: vscode.TextEditor) {
 
   suppressEditorChange = false;
 
+  // triggers whenever a change in made from other users
   ytext.observe((event, transaction) => {
     if (transaction.origin === "local") return;
 
@@ -320,6 +366,7 @@ function connectToFile(file: string, editor: vscode.TextEditor) {
       if (current === text) return;
 
       suppressEditorChange = true;
+      // replace all the content in the file with the new version of the text
       editor.edit((editBuilder) => {
         editBuilder.replace(
           new vscode.Range(
@@ -331,19 +378,21 @@ function connectToFile(file: string, editor: vscode.TextEditor) {
       }).then(() => suppressEditorChange = false);
   })
 
+  // triggers whenenver the another user's cursor moves
   cursors.observe(() => {
+    // for each cursor make a new text decoration to show the cursor
     const decorations: vscode.DecorationOptions[] = [];
     if (!cursors) return;
       for (const [id, cursorData] of cursors.entries()) {
         if (id === uid) continue;
 
-        const data = cursorData as { start: number; end: number; color: string };
+        const data = cursorData as { start: number; end: number; colour: string };
         const start = editor.document.positionAt(data.start);
         const end = editor.document.positionAt(data.end);
 
         let deco = decorationTypes.get(id);
         if (!deco) {
-          deco = createCursorDecoration(data.color);
+          deco = createCursorDecoration(data.colour);
           decorationTypes.set(id, deco);
         }
 
@@ -363,8 +412,10 @@ function connectToFile(file: string, editor: vscode.TextEditor) {
   })
 }
 
+// the connection state of the user, used when joining rooms and mainting connection
 let state: {uid: string, pass: string, room: string} | undefined;
 
+// this signals to the server that the client wants to transfer the state of the old connection to the new one
 function recoverState() {
   if (!state) return;
   socket.emit('recoverState', state.uid, state.pass)
@@ -380,6 +431,7 @@ export async function activate(context: vscode.ExtensionContext) {
     folder => folder.uri.scheme === FILE_SYSTEM_SCHEME
   );
 
+  // if in a collab workspace, but there's no active connection trying to be made, close the workspace
   if (isCollabWorkspace) {
     if (!state) {
       vscode.window.showErrorMessage('Room closed.');
@@ -388,14 +440,20 @@ export async function activate(context: vscode.ExtensionContext) {
     }
   }
 
+  // if joining a room and connected, then recover the connection state
   if (socket.connected) {
     recoverState()
   }
+
+  // remove the connection state
   context.globalState.update('state', undefined);
 
+  // adds a Create Room command to the command palette
   context.subscriptions.push(vscode.commands.registerCommand('collab.createRoom', () => {createRoom(context)}))
 
+  // adds a Join Room command to the command palette
   context.subscriptions.push(vscode.commands.registerCommand('collab.joinRoom', async () => {
+    // first, get the list of rooms, then let the user choose which one to join
     socket.emit('getRooms', async (rooms: Record<string, RoomData>) => {
       const roomName = await vscode.window.showQuickPick(Object.keys(rooms), {placeHolder: 'Room to join'})
       if (roomName) {
@@ -404,8 +462,12 @@ export async function activate(context: vscode.ExtensionContext) {
     })
   }))
 
+  // adds a Leave Room command to the command palette
   context.subscriptions.push(vscode.commands.registerCommand('collab.leaveRoom', () => {
+    // disconnect from the yjs syncing server
     if (provider) provider.disconnect();
+
+    // first, let the server remove the user from it's state, then continue
     socket.emit('leaveRoom', () => {
       vscode.window.showInformationMessage('Left room');
       const wasHost = isHost;
@@ -414,10 +476,11 @@ export async function activate(context: vscode.ExtensionContext) {
 
       if (workspaceWatcher) workspaceWatcher.dispose()
 
+      // clear syncing state
       ytext = undefined;
       doc = undefined;
       cursors = undefined;
-      clientColor = undefined;
+      clientColour = undefined;
 
       if (loadStatus) {
         loadStatus.text = `$(check-all) Server connected`;
@@ -425,10 +488,12 @@ export async function activate(context: vscode.ExtensionContext) {
         loadStatus.backgroundColor = undefined;
       }
 
+      // if not the host, then close the workspace
       if (!wasHost) vscode.commands.executeCommand('workbench.action.closeFolder');
     })
   }))
 
+  // used for debugging at some point
   context.subscriptions.push(vscode.commands.registerCommand('collab.debugTest', () => {
     const editor = vscode.window.activeTextEditor;
     if (!editor) return;
@@ -437,13 +502,16 @@ export async function activate(context: vscode.ExtensionContext) {
     }) 
   }))
 
+  // triggers whenever the user switches the file they have open
   vscode.window.onDidChangeActiveTextEditor((event) => {
     if (!event) return;
+    // if the user is in a room, get the current file and connect to the syncing server for that file
     const file = getRelativePath(event.document.uri);
     if (!file || !room) return;
     connectToFile(file, event)
   })
 
+  // triggers whenever the user makes a change to the text document
   vscode.workspace.onDidChangeTextDocument((event) => {
     const cytext = ytext;
     if (!cytext) return;
@@ -452,25 +520,30 @@ export async function activate(context: vscode.ExtensionContext) {
 
     if (suppressEditorChange) return;
 
+    // update synced yjs text with new document contents
     if (cytext.doc) cytext.doc.transact(() => {
       cytext.delete(0, cytext.length);
       cytext.insert(0, editor.document.getText());
     }, "local");
   });
 
+  // triggers whenever the user changes or moves their cursor selection on the document
   vscode.window.onDidChangeTextEditorSelection((event) => {
     const editor = event.textEditor;
     if (!editor) return;
 
-    if (!cursors || !clientColor) return;
+    // update synced cursor state with new cursor position
+    if (!cursors || !clientColour) return;
     cursors.set(uid, {
       start: editor.document.offsetAt(editor.selection.start),
       end: editor.document.offsetAt(editor.selection.end),
-      color: clientColor,
+      colour: clientColour,
     });
   })
 
+  // triggers only one time once the user connects to the main socket.io server
   socket.once('connect', async () => {
+    // sets up the file provider for the room so that the client user can read the host's files
     fileProvider = new FileProvider(socket);
     await fileProvider.waitForConnection();
     fileProvider.root = room;

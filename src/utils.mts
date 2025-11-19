@@ -27,14 +27,14 @@ export function getRelativePathUri(uri: vscode.Uri): string | undefined {
 
 export const decorationTypes = new Map<string, vscode.TextEditorDecorationType>();
 
-export function createCursorDecoration(color: string) {
-  const transparentColor = `${color}80`
+export function createCursorDecoration(colour: string) {
+  const transparentColor = `${colour}80`
   return vscode.window.createTextEditorDecorationType({
     borderWidth: '1px',
     borderStyle: 'solid',
-    borderColor: color,
+    borderColor: colour,
     backgroundColor: transparentColor,
-    overviewRulerColor: color,
+    overviewRulerColor: colour,
     overviewRulerLane: vscode.OverviewRulerLane.Right,
     isWholeLine: false,
   });
